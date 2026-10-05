@@ -6,6 +6,7 @@ import torch
 import shutil
 from utils import factory
 from utils.data_manager import DataManager
+from utils.dil_data_manager import DILDataManager
 from utils.toolkit import count_parameters
 import os
 import numpy as np
@@ -25,8 +26,14 @@ def train(args):
 def _train(args):
 
     cur_time = time.strftime('%Y%m%d-%H%M%S', time.localtime())
-    init_cls = 0 if args ["init_cls"] == args["increment"] else args["init_cls"]
-    logs_name = f'logs/{args["model_name"]}/{args["prefix"]}/{cur_time}/{args["dataset"]}/{init_cls}/{args["increment"]}/'
+    scenario = args.get("scenario", "cil").lower()
+    if scenario == "dil":
+        split_tag = "dil"
+    else:
+        init_cls = 0 if args["init_cls"] == args["increment"] else args["init_cls"]
+        split_tag = f'{init_cls}/{args["increment"]}'
+    logs_name = f'logs/{args["model_name"]}/{args["prefix"]}/{cur_time}/{args["dataset"]}/{split_tag}/'
+    args["logs_name"] = logs_name
     
     if not os.path.exists(logs_name):
         os.makedirs(logs_name)
@@ -48,14 +55,20 @@ def _train(args):
     _set_device(args)
     print_args(args)
 
-    data_manager = DataManager(
-        args["dataset"],
-        args["shuffle"],
-        args["seed"],
-        args["init_cls"],
-        args["increment"],
-        args,
-    )
+    if scenario == "dil":
+        # Domain-incremental: one label space shared by all tasks (domains).
+        data_manager = DILDataManager(args["dataset"], args["seed"], args)
+        args.setdefault("init_cls", data_manager.nb_classes)
+        args.setdefault("increment", data_manager.nb_classes)
+    else:
+        data_manager = DataManager(
+            args["dataset"],
+            args["shuffle"],
+            args["seed"],
+            args["init_cls"],
+            args["increment"],
+            args,
+        )
     
     args["nb_classes"] = data_manager.nb_classes # update args
     args["nb_tasks"] = data_manager.nb_tasks

@@ -76,6 +76,18 @@ bash scripts/imagenet-r/run_inr_20task_b0inc10.sh  # 20 tasks
 
 All remaining experimental settings are provided in [scripts](scripts/).
 
+## MoSS (subset-shared invariance) learner
+
+This fork also contains **MoSS**, a mixture-of-experts continual learner that aligns each expert's class-conditional features across a learned subset of related tasks and adds experts only when a matched validation test justifies the extra capacity. It targets domain-incremental learning (`"scenario": "dil"`) and plugs into the same training loop:
+
+```bash
+bash scripts/moss/run_synthetic_dil.sh      # CPU smoke test
+bash scripts/moss/run_domainnet_dil.sh      # DomainNet, 6 domains
+bash scripts/moss/run_alignment_ablation.sh # subset / none / global / random alignment
+```
+
+See [MOSS.md](MOSS.md) for dataset layouts, the paper-to-code map, configuration, and diagnostics.
+
 ## Citations
 
 - If you find this project useful for your research, please cite:

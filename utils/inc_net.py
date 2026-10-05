@@ -130,3 +130,51 @@ class CaRENet(nn.Module):
     def forward(self, x, adapter_id=-1, train=False, fc_only=False):
         res = self.backbone(x, adapter_id, train, fc_only)
         return res
+
+# ----------------------------------------------------------------------------------------------
+# MoSS: frozen pretrained backbone b0 + expert bank / router / shared head (Sec. 3.2)
+# ----------------------------------------------------------------------------------------------
+def get_frozen_backbone(args):
+    """Return (module, out_dim). b0 is frozen for the whole sequence, so stored features stay
+    comparable across stages and can be processed by existing and newly added experts."""
+    name = args["backbone_type"].lower()
+    if name == "identity":
+        # Inputs are already feature vectors (e.g. the synthetic subset-sharing benchmark).
+        return nn.Identity(), int(args["feature_dim"])
+    if name.endswith("_brmoe"):
+        raise ValueError("MoSS uses a plain frozen backbone; drop the '_brmoe' suffix "
+                         "(e.g. 'vit_base_patch16_224_in21k').")
+    import timm
+    model = timm.create_model(name, pretrained=args.get("pretrained", True), num_classes=0)
+    for p in model.parameters():
+        p.requires_grad = False
+    model.eval()
+    return model, int(model.num_features)
+
+
+class MoSSNet(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        from backbone.moss_moe import ExpertMixture
+        self.backbone, self.feature_dim = get_frozen_backbone(args)
+        self.moe = ExpertMixture(
+            in_dim=self.feature_dim,
+            num_classes=args["nb_classes"],
+            num_experts=args.get("num_experts_init", 2),
+            hidden_dim=args.get("expert_hidden_dim", 256),
+            out_dim=args.get("expert_out_dim", 128),
+            topk=args.get("topk_experts", 2),
+            tau=args.get("router_tau", 1.0),
+        )
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.backbone.eval()  # b0 is frozen: never enable dropout / stochastic depth in it
+        return self
+
+    @torch.no_grad()
+    def backbone_features(self, x):
+        return self.backbone(x)
+
+    def forward(self, x):
+        return self.moe(self.backbone_features(x))
