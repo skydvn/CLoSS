@@ -60,5 +60,8 @@
         "Real World"
     ],
     "test_frac": 0.2,
-    "memory_size": 2000
+    "memory_size": 2000,
+    "wandb": false,
+    "wandb_project": "closs",
+    "wandb_mode": "online"
 }

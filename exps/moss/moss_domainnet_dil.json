@@ -61,5 +61,8 @@
         "real",
         "sketch"
     ],
-    "memory_size": 10000
+    "memory_size": 10000,
+    "wandb": false,
+    "wandb_project": "closs",
+    "wandb_mode": "online"
 }

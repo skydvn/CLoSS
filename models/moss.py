@@ -26,6 +26,7 @@ import json
 import logging
 import math
 import os
+import re
 from collections import OrderedDict
 
 import numpy as np
@@ -39,6 +40,7 @@ from models.base import BaseLearner
 from utils.inc_net import MoSSNet
 from utils.moss_losses import cross_cov_div, kd_kl, mmd2, pairwise_sq_dists
 from utils.moss_memory import MoSSMemory
+from utils import wandb_logger
 
 DEFAULTS = dict(
     scenario="cil",
@@ -85,6 +87,8 @@ DEFAULTS = dict(
     max_expansion_trials=2,       # G
     warmup_steps=50,
     probe_size=2048,
+    # experiment tracking (only used when the config sets "wandb": true)
+    wandb_log_interval=50,        # log training losses every N optimizer steps; 0 = off
 )
 
 
@@ -114,6 +118,8 @@ class Learner(BaseLearner):
         self._n_old_experts = moe.num_experts
         self.diagnostics = []
         self._cil_warned = False
+        self._train_step = 0
+        self._experts_added = 0
 
         logging.info(f"[MoSS] scenario={self.scenario}, ssi_mode={self.hp['ssi_mode']}, "
                      f"feature_dim={self._network.feature_dim}, M0={moe.num_experts}, k={moe.topk}, "
@@ -226,6 +232,7 @@ class Learner(BaseLearner):
         diag["experts_after"] = self._network.moe.num_experts
         diag["P_E"] = self._network.moe.stored_expert_router_params()
         self.diagnostics.append(diag)
+        self._log_task_wandb(t, diag)
         logging.info(f"[MoSS] Task {t} done: experts {diag['experts_before']} -> {diag['experts_after']}, "
                      f"P_E={diag['P_E']:,}/{self.p_max:,}")
 
@@ -296,6 +303,13 @@ class Learner(BaseLearner):
             opt.step()
             for k, v in parts.items():
                 sums[k] = sums.get(k, 0.0) + v
+            self._train_step += 1
+            interval = int(hp["wandb_log_interval"])
+            if wandb_logger.active() and interval > 0 and self._train_step % interval == 0:
+                kind = re.sub(r"\d+", "", name)  # expand0-candidate -> expand-candidate
+                wandb_logger.log({"train_step": self._train_step, "train/task": self._cur_task,
+                                  **{f"train/{kind}/{k}": v for k, v in parts.items()},
+                                  f"train/{kind}/total": loss.item()})
             if step in eval_points and step >= warmup_steps:
                 moe.forced_expert = None
                 risk, f_t, p_e = self._checkpoint_stats(moe)
@@ -652,6 +666,49 @@ class Learner(BaseLearner):
             self.diagnostics[-1]["eval"] = {k: float(v) for k, v in grouped.items()}
         logging.info(f"[MoSS] eval: {dict(grouped)}")
         return ret, None
+
+    def _log_task_wandb(self, t, diag):
+        """CLoSS-specific per-task metrics: capacity, expansion decisions, supports, phase health."""
+        if not wandb_logger.active():
+            return
+        trials = [e for e in diag["expansion"] if "accepted" in e]
+        accepted = sum(1 for e in trials if e["accepted"])
+        self._experts_added += accepted
+        data = {
+            "task": t,
+            "moss/experts": diag["experts_after"],
+            "moss/experts_added_total": self._experts_added,
+            "moss/P_E": diag["P_E"],
+            "moss/P_E_frac_of_max": diag["P_E"] / self.p_max,
+            "moss/expansion/trials": len(trials),
+            "moss/expansion/accepted": accepted,
+            "moss/sigma": diag["sigma"],
+        }
+        if trials:
+            data["moss/expansion/first_delta"] = trials[0].get("delta")
+            data["moss/expansion/threshold"] = trials[0].get("threshold")
+        sup = diag.get("supports")
+        if sup:
+            data["moss/supports/I_t"] = sup["I_t"]
+            data["moss/supports/J_t"] = len(sup["J_t"])
+            data["moss/supports/candidate_triples"] = sup["candidate_triples"]
+            data["moss/supports/hist_cells_eligible"] = sup["hist_cells_eligible"]
+            if sup["hist_cells_possible"]:
+                data["moss/supports/hist_cells_eligible_frac"] = sup["hist_cells_eligible"] / sup["hist_cells_possible"]
+            if sup["mmd_quantiles"]:
+                data["moss/supports/mmd_median"] = sup["mmd_quantiles"][1]
+        for phase in ("first", "reuse", "adapt"):
+            info = diag.get(phase)
+            if not info:
+                continue
+            data[f"moss/{phase}/fallback_to_input"] = int(info["fallback_to_input"])
+            data[f"moss/{phase}/feasible_frac"] = info["feasible_checkpoints"] / max(1, info["checkpoints"])
+            if info["val_risk"] is not None:
+                data[f"moss/{phase}/val_risk"] = info["val_risk"]
+                data[f"moss/{phase}/F_t"] = info["F_t"]
+            for k, v in info["mean_losses"].items():
+                data[f"moss/{phase}/loss_{k}"] = v
+        wandb_logger.log(data)
 
     def _dump_diagnostics(self):
         path = self.args.get("logs_name")

@@ -54,5 +54,8 @@
     "dataset": "imagenetr",
     "init_cls": 20,
     "increment": 20,
-    "memory_size": 4000
+    "memory_size": 4000,
+    "wandb": false,
+    "wandb_project": "closs",
+    "wandb_mode": "online"
 }

@@ -13,7 +13,8 @@ Config keys (all optional unless noted):
 Layouts:
   domainnet        <root>/<domain>_train.txt, <root>/<domain>_test.txt  (official split files; lines
                    "<domain>/<class>/<file> <label>", paths relative to <root>)
-  imagenetr_dil    <root>/{train,test}/<wnid>/<rendition>_<n>.jpg  (rendition parsed from the file name)
+  imagenetr_dil    <root>/{train,test}/<wnid>/<rendition>_<n>.jpg  (rendition parsed from the file name;
+                   build it with: bash scripts/download_data.sh imagenetr_dil)
   folder_dil       <root>/<domain>/{train,test}/<class>/*  or  <root>/<domain>/<class>/*  (seeded split)
   synthetic_subset generated in memory; see SyntheticSubsetDIL
 """
@@ -96,7 +97,7 @@ class ImageNetRDIL(_ImageSource):
     _pat = re.compile(r"^(?P<dom>[A-Za-z]+)_\d+\.[A-Za-z]+$")
 
     def load(self, seed):
-        root = self.args.get("data_path", os.path.join(data_root, "imagenet-r"))
+        root = self.args.get("data_path", os.path.join(data_root, "imagenet-r-dil"))
         per_split = {}
         classes = None
         for part in ("train", "test"):

@@ -12,6 +12,7 @@ MoSS is defined for **domain-incremental** learning (one label space, tasks are 
 | `backbone/moss_moe.py` | Expert bank (two-layer MLPs), linear top-k router, shared head, warm-up routing, leave-one-expert-out composition. |
 | `utils/moss_losses.py` | Gaussian MMD² (V- or U-statistic), normalized cross-covariance (linear CKA), distillation KL. |
 | `utils/moss_memory.py` | Fit/val reservoirs of `(u, y, task)` features; task-uniform replay sampling. |
+| `utils/wandb_logger.py` | Optional Weights & Biases logging (off unless `"wandb": true`). |
 | `utils/dil_data_manager.py` | Domain-incremental data: DomainNet, ImageNet-R by rendition, generic domain folders, synthetic subset-sharing benchmark. |
 | `utils/inc_net.py` (appended) | `MoSSNet` = frozen backbone + expert mixture; `get_frozen_backbone`. |
 | `trainer.py`, `main.py`, `utils/factory.py` | `scenario` switch (`"cil"` / `"dil"`), `--set KEY=VALUE` overrides, `moss` registration. |
@@ -21,6 +22,9 @@ MoSS is defined for **domain-incremental** learning (one label space, tasks are 
 ## Quick start
 
 ```bash
+# Download the domain-incremental datasets (DomainNet, ImageNet-R split by rendition, Office-Home)
+bash scripts/download_data.sh moss
+
 # CPU smoke test on the synthetic benchmark (seconds)
 bash scripts/moss/run_synthetic_dil.sh
 
@@ -43,10 +47,12 @@ Each run writes `logs/moss/<prefix>/<time>/<dataset>/dil/` containing `summary.l
 
 ## Dataset layouts
 
+`scripts/download_data.sh` downloads and arranges every dataset below, as well as CaRE's class-incremental benchmarks. Run `bash scripts/download_data.sh list` to see the targets. Set `DATA_ROOT=/big/disk/dataset` to store data elsewhere; `<repo>/dataset` then becomes a symlink to it. Downloads resume, and finished datasets are skipped on re-runs. On an offline machine, put the archives in `dataset/_archives/` first and the script uses them.
+
 Paths are relative to the repo root unless `data_path` is set.
 
 - **`domainnet`**: `dataset/domainnet/<domain>_{train,test}.txt` (official split files; lines `<domain>/<class>/<file> <label>`), with images under the same root.
-- **`imagenetr_dil`**: the repo's existing `dataset/imagenet-r/{train,test}/<wnid>/<rendition>_<n>.jpg`. Each task is one rendition, parsed from the file name. All discovered renditions are used unless `domains` is set.
+- **`imagenetr_dil`**: `dataset/imagenet-r-dil/{train,test}/<wnid>/<rendition>_<n>.jpg`, built by `bash scripts/download_data.sh imagenetr_dil` from the official ImageNet-R tar with a seeded 80/20 split per (class, rendition), so every rendition has train and test images. Each task is one rendition, parsed from the file name. All discovered renditions are used unless `domains` is set. This is separate from CaRE's `dataset/imagenet-r`, which uses the LAMDA-PILOT class-incremental split.
 - **`folder_dil`**: `<data_path>/<domain>/{train,test}/<class>/*`, or `<data_path>/<domain>/<class>/*` with a seeded `test_frac` split. Only classes present in every domain are kept. This works for Office-Home, PACS, VLCS, and CORe50 sessions arranged as folders.
 - **`synthetic_subset`**: generated in memory, with `backbone_type: "identity"`. Task `s` carries class signal only in its factor subset `syn_task_factors[s]`; other blocks are task-specific nuisance. The default schedule `[[0,1],[1,2],[0,2],[3],[1,3]]` mixes new combinations of familiar factors with a genuinely new factor, and the ground truth is saved in the diagnostics.
 
@@ -97,6 +103,34 @@ All are optional, with defaults in `models/moss.py: DEFAULTS`.
 - **Per phase:** checkpoints evaluated, how many were feasible, whether the phase fell back to its input, the selected `val_risk` and `F_t`, and mean loss terms.
 - **Expansion trials:** `delta`, `threshold`, accept/reject, and the reason for stopping.
 - **Final state:** the fixed σ, the expert count and `P_E` after the task, and per-task accuracies.
+
+## Experiment tracking with Weights & Biases
+
+Tracking is off by default. To use it:
+
+```bash
+python -m pip install wandb && wandb login        # once
+
+bash scripts/moss/run_officehome_dil.sh --set wandb=true
+bash scripts/moss/run_officehome_dil.sh --set wandb=true wandb_project='"closs"' wandb_entity='"your-team"'
+WANDB=1 bash scripts/moss/run_alignment_ablation.sh exps/moss/moss_domainnet_dil.json   # grouped by mode
+
+# no internet on the training machine: log offline, upload later
+bash scripts/moss/run_synthetic_dil.sh --set wandb=true wandb_mode='"offline"'
+wandb sync logs/.../wandb/offline-run-*
+```
+
+It also works for CaRE runs, e.g. `python main.py --config exps/imagenet_r/care_inr_inc20.json --set wandb=true`, because the per-task accuracy logging lives in `trainer.py`.
+
+Each seed is one wandb run, named `<prefix>-s<seed>` and grouped by `prefix`. The ablation script groups by alignment mode instead, so seeds average together. What gets logged:
+
+- **The full config**, including every CLoSS hyperparameter.
+- **Accuracy per task** (x-axis `task`): `acc/top1`, `acc/avg_top1`, `acc/old`, `acc/new`, top-5 accuracy, accuracy on each task group (`acc_task/*`), running `forgetting/top1`, and the total parameter count.
+- **CLoSS state per task:** expert count, experts added so far, `P_E` and its fraction of `P_max`, expansion trials and acceptances with the validation gain and threshold, support sizes (`I_t`, `J_t`, eligible historical cells, median MMD), and for each phase its fallback flag, fraction of feasible checkpoints, validation risk, `F_t`, and mean losses.
+- **Training losses** every `wandb_log_interval` steps (default 50; x-axis `train_step`), per phase and loss term.
+- **At the end:** the accuracy matrix as a table, `final/avg_top1`, `final/last_top1`, and `final/forgetting` in the run summary, plus the run's `summary.log`, config, and `moss_diagnostics.json` as files. Set `wandb_save_model=true` to also upload `latest_model.pth` (large for ViT models).
+
+A run that crashes is closed with exit code 1, so it shows as failed in wandb. Other keys: `wandb_group`, `wandb_name`, `wandb_tags`, `wandb_mode` (`online`, `offline`, `disabled`).
 
 ## Implementation choices where the paper is not specific
 

@@ -8,6 +8,7 @@ from utils import factory
 from utils.data_manager import DataManager
 from utils.dil_data_manager import DILDataManager
 from utils.toolkit import count_parameters
+from utils import wandb_logger
 import os
 import numpy as np
 
@@ -20,7 +21,12 @@ def train(args):
     for seed in seed_list:
         args["seed"] = seed
         args["device"] = device
-        _train(args)
+        try:
+            _train(args)
+        except BaseException:
+            wandb_logger.finish(exit_code=1)  # mark the run as failed, keep its logs
+            raise
+        wandb_logger.finish()
 
 
 def _train(args):
@@ -75,6 +81,7 @@ def _train(args):
     # print_forget = args.get('print_forget', True)
     args["print_forget"] = args.get("print_forget", True)
     model = factory.get_model(args["model_name"], args)
+    wandb_logger.init(args)  # no-op unless the config sets "wandb": true
 
     logging.info("Train Augmentation {}".format(data_manager._train_trsf))
     logging.info("Test Augmentation {}".format(data_manager._test_trsf))
@@ -148,6 +155,11 @@ def _train(args):
 
             print('Average Accuracy (CNN):', sum(cnn_curve["top1"])/len(cnn_curve["top1"]))
             logging.info("Average Accuracy (CNN): {} \n".format(sum(cnn_curve["top1"])/len(cnn_curve["top1"])))
+
+        wandb_logger.log_task(task, cnn_accy, cnn_curve["top1"], cnn_matrix, topk,
+                              n_params=count_parameters(model._network))
+
+    wandb_logger.log_final(cnn_matrix, cnn_curve["top1"])
 
     if args["print_forget"]:
         if len(cnn_matrix) > 0:

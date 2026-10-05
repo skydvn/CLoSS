@@ -52,6 +52,9 @@
     "warmup_steps": 100,
     "probe_size": 2048,
     "dataset": "imagenetr_dil",
-    "data_path": "dataset/imagenet-r",
-    "memory_size": 4000
+    "data_path": "dataset/imagenet-r-dil",
+    "memory_size": 4000,
+    "wandb": false,
+    "wandb_project": "closs",
+    "wandb_mode": "online"
 }

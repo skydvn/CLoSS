@@ -1,0 +1,55 @@
+# ---------------------------------------------------------------- Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# ---------------------------------------------------------------- Environments
+.venv/
+venv/
+env/
+.conda/
+.python-version
+
+# ---------------------------------------------------------------- Testing / tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# ---------------------------------------------------------------- Data (see readme: datasets live in dataset/)
+/dataset
+data/
+
+# ---------------------------------------------------------------- Experiment outputs
+# trainer.py writes summary.log, the copied config, latest_model.pth and
+# moss_diagnostics.json under logs/<model>/<prefix>/<time>/...
+logs/
+wandb/
+runs/
+pretrained_models/
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.npz
+# t-SNE plots written to the repo root by BaseLearner.tsne()
+*tsne.pdf
+
+# ---------------------------------------------------------------- Editors / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# ---------------------------------------------------------------- Cluster job logs
+slurm-*.out
+nohup.out

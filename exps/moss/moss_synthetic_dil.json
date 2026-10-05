@@ -6,23 +6,44 @@
     "backbone_type": "identity",
     "memory_size": 1000,
     "shuffle": false,
-    "device": [-1],
-    "seed": [1993],
-
+    "device": [
+        -1
+    ],
+    "seed": [
+        1993
+    ],
     "syn_num_classes": 20,
     "syn_num_factors": 4,
     "syn_factor_dim": 16,
-    "syn_task_factors": [[0, 1], [1, 2], [0, 2], [3], [1, 3]],
+    "syn_task_factors": [
+        [
+            0,
+            1
+        ],
+        [
+            1,
+            2
+        ],
+        [
+            0,
+            2
+        ],
+        [
+            3
+        ],
+        [
+            1,
+            3
+        ]
+    ],
     "syn_train_per_class": 100,
     "syn_test_per_class": 50,
     "syn_proto_scale": 0.5,
-
     "num_experts_init": 2,
     "expert_hidden_dim": 64,
     "expert_out_dim": 32,
     "topk_experts": 2,
     "router_tau": 1.0,
-
     "val_frac": 0.1,
     "memory_val_frac": 0.2,
     "num_workers": 0,
@@ -34,13 +55,11 @@
     "reuse_epochs": 5,
     "adapt_epochs": 8,
     "expand_epochs": 8,
-
     "lambda_rep": 1.0,
     "lambda_pred": 1.0,
     "lambda_feat": 1.0,
     "lambda_ssi": 1.0,
     "lambda_div": 0.1,
-
     "ssi_mode": "subset",
     "delta_u": 0.0,
     "delta_d": 0.3,
@@ -49,10 +68,12 @@
     "ssi_max_hist_tasks": 3,
     "ssi_triples_per_step": 4,
     "ssi_samples_per_cell": 32,
-
     "eps_f": 0.15,
     "p_max_factor": 4.0,
     "lambda_grow": 0.5,
     "max_expansion_trials": 2,
-    "warmup_steps": 20
+    "warmup_steps": 20,
+    "wandb": false,
+    "wandb_project": "closs",
+    "wandb_mode": "online"
 }

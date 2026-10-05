@@ -40,7 +40,7 @@ Our long-task-sequence CIL benchmark, **OmniBenchmark-1K**, can be downloaded fr
 
 The remaining benchmark datasets used in this paper can be obtained from the processed [dataset links](https://github.com/LAMDA-CL/LAMDA-PILOT/tree/main#-datasets) released by [LAMDA-PILOT](https://github.com/LAMDA-CL/LAMDA-PILOT/tree/main#-datasets).
 
-**NOTE**: Please place all processed datasets under the `dataset/` directory. If you prefer a different storage location, you can modify `data_root` in [utils/data.py](utils/data.py) to customize your dataset save directory.
+**NOTE**: Please place all processed datasets under the `dataset/` directory, or run `bash scripts/download_data.sh care` to download and arrange them (`list` shows every target). If you prefer a different storage location, you can modify `data_root` in [utils/data.py](utils/data.py) to customize your dataset save directory.
 
 ### 2. Requirements
 
@@ -81,12 +81,13 @@ All remaining experimental settings are provided in [scripts](scripts/).
 This fork also contains **MoSS**, a mixture-of-experts continual learner that aligns each expert's class-conditional features across a learned subset of related tasks and adds experts only when a matched validation test justifies the extra capacity. It targets domain-incremental learning (`"scenario": "dil"`) and plugs into the same training loop:
 
 ```bash
+bash scripts/download_data.sh moss          # DomainNet, ImageNet-R (DIL split), Office-Home
 bash scripts/moss/run_synthetic_dil.sh      # CPU smoke test
 bash scripts/moss/run_domainnet_dil.sh      # DomainNet, 6 domains
 bash scripts/moss/run_alignment_ablation.sh # subset / none / global / random alignment
 ```
 
-See [MOSS.md](MOSS.md) for dataset layouts, the paper-to-code map, configuration, and diagnostics.
+Add `--set wandb=true` to any run (CaRE or MoSS) to log it to Weights & Biases. See [MOSS.md](MOSS.md) for dataset layouts, the paper-to-code map, configuration, diagnostics, and wandb tracking.
 
 ## Citations
 
