@@ -1,0 +1,53 @@
+{
+  "prefix": "norga",
+  "dataset": "cifar224",
+  "memory_size": 0,
+  "memory_per_class": 0,
+  "fixed_memory": false,
+  "shuffle": true,
+  "init_cls": 10,
+  "increment": 10,
+  "model_name": "norga",
+  "backbone_type": "vit_base_patch16_224_in21k",
+  "device": ["0"],
+  "seed": [1993],
+  "scenario": "cil",
+
+  "norga": true,
+  "gate_act": "tanh",
+  "act_scale_init": [1.0, 1.0],
+  "prompt_layers": [0, 1, 2, 3, 4],
+  "prompt_length": 5,
+  "prompt_init": "uniform",
+  "prompt_init_from_prev": true,
+  "prompt_momentum": 0.01,
+
+  "wtp_epochs": 50,
+  "wtp_batch_size": 24,
+  "wtp_optimizer": "adam",
+  "wtp_lr": 0.005,
+  "wtp_weight_decay": 0.0,
+  "wtp_scheduler": "cosine",
+  "train_mask": true,
+  "reg": 0.1,
+  "cr_temperature": 0.8,
+
+  "stats_cov_type": "full",
+  "stats_shrink": 0.0001,
+
+  "tii_head": "linear",
+  "tii_n_centroids": 1,
+  "tii_epochs": 20,
+  "tii_lr": 0.0005,
+  "tii_ca_epochs": 30,
+  "tii_ca_lr": 0.005,
+
+  "ca_epochs": 30,
+  "ca_lr": 0.005,
+  "ca_samples_per_class": 120,
+  "ca_weight_decay": 0.0005,
+
+  "num_workers": 8,
+  "eval_batch_size": 128,
+  "eval_oracle": true
+}
