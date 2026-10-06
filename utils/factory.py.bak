@@ -1,8 +1,4 @@
 def get_model(model_name, args):
-    # NoRGa / HiDe-Prompt prompt-based baseline (see NORGA.md)
-    if str(model_name).lower() in ("norga", "promptcl", "hideprompt"):
-        from models.norga import Learner as _NoRGaLearner
-        return _NoRGaLearner(args)
     name = model_name.lower()
     if name == 'care':
         from models.care import Learner

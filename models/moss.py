@@ -2,10 +2,10 @@
 MoSS: Mixture of Specialized Skills with subset-shared invariance for continual learning.
 
 Implements Sec. 3 of the paper on top of the CaRE / PILOT training loop:
-
-  3.2  Frozen backbone b0, expert bank, linear top-k router, shared head        (backbone/moss_moe.py)
-  3.3  Expert-specific task supports (rho, U, MMD gate, top-L) + L_ssi, L_div    (_estimate_supports, _loss)
-  3.4  Reuse -> selective adaptation -> matched expansion trials                  (_learn_task, _expansion_trials)
+  3.2  Frozen backbone b0, expert bank, linear top-k router, shared head   (backbone/moss_moe.py)
+  3.3  Expert-specific task supports (rho, U, MMD gate, top-L) + L_ssi, L_div   (_estimate_supports, _loss)
+  3.4  Reuse (dense exploration -> sparse refinement) -> selective adaptation -> matched
+       expansion trials   (_learn_task, _expansion_trials)
   3.5  L_sup with task-uniform replay, L_pred, L_feat, reservoir memory update   (_loss, utils/moss_memory.py)
 
 Scenarios
@@ -18,8 +18,24 @@ Scenarios
 Alignment controls (Sec. 1 / evaluation design), selected with "ssi_mode":
   "subset"  the proposed rule (Eq. 13-14).
   "none"    identical supports and J_t, but lambda_ssi is not applied (isolates the alignment term).
-  "global"  every eligible (m, s, c) triple, uniform weights; J_t = all old experts.
+  "global"  every eligible (m, s, c) triple, uniform weights.
   "random"  as many triples as "subset" would select, drawn uniformly from the eligible triples.
+With ssi_control_J="matched" (default) the "global" and "random" controls adapt exactly the
+experts of the subset rule's J_t and draw their triples from those experts only, so every control
+differs from "subset" only in which cells are aligned. ssi_control_J="own" restores the earlier
+behaviour (global: all old experts; random: the experts of the random triples).
+
+Revision (after review of commit 173badb)
+  * Reuse explores existing experts: `reuse_explore_epochs` epochs of dense routing (all experts
+    active, experts frozen) before `reuse_epochs` of ordinary sparse refinement. Only sparse
+    checkpoints are eligible, and supports are estimated from the selected sparse checkpoint.
+  * Eq. 11 leave-one-out is recomputed as a softmax over the active set without m (stable).
+  * Checkpoint selection compares the phase's input checkpoint with the post-update checkpoints
+    when it is feasible (`select_include_input`), except in the expansion candidate branch.
+  * Prediction (validation, retention risks, evaluation, prediction losses that need no auxiliary
+    outputs) uses routing-based dispatch (`sparse_dispatch`).
+  * `ssi_max_cell_samples` defaults to -1 (every record), as the paper describes.
+  * Expansion records whether the control is still the pre-task model (diagnostic only).
 """
 import copy
 import json
@@ -45,9 +61,9 @@ from utils import wandb_logger
 DEFAULTS = dict(
     scenario="cil",
     # data / memory (Sec. 3.1)
-    val_frac=0.1,                 # validation portion of the current task
-    memory_size=2000,             # B = B_tr + B_val
-    memory_val_frac=0.2,          # B_val / B
+    val_frac=0.1,              # validation portion of the current task
+    memory_size=2000,          # B = B_tr + B_val
+    memory_val_frac=0.2,       # B_val / B
     extract_batch_size=128,
     num_workers=4,
     # optimization
@@ -57,10 +73,13 @@ DEFAULTS = dict(
     batch_size=64,
     replay_batch_size=64,
     first_task_epochs=10,
-    reuse_epochs=5,
+    reuse_explore_epochs=2,    # dense-routing exploration epochs at the start of reuse; 0 = off
+    reuse_epochs=5,            # sparse refinement epochs of reuse (only these are checkpointed)
     adapt_epochs=5,
     expand_epochs=5,
-    eval_interval=0,              # steps between checkpoint evaluations; 0 = once per epoch
+    eval_interval=0,           # steps between checkpoint evaluations; 0 = once per epoch
+    select_include_input=True, # a feasible input checkpoint competes in checkpoint selection
+    sparse_dispatch=True,      # routing-based dispatch for prediction
     # loss weights (Eq. 29), fixed across tasks
     lambda_rep=1.0,
     lambda_pred=1.0,
@@ -69,27 +88,63 @@ DEFAULTS = dict(
     lambda_div=0.1,
     # supports and alignment (Sec. 3.3)
     ssi_mode="subset",
+    ssi_control_J="matched",   # "matched": global/random adapt the subset rule's J_t; "own": earlier behaviour
     delta_u=0.0,
     delta_d=0.3,
-    mmd_sigma="auto",             # float, or "auto": median heuristic on task-0 expert outputs, then frozen
-    mmd_estimator="v",            # "v" = paper (all pairs incl. diagonal); "u" = unbiased
-    ssi_max_hist_tasks=3,         # L
+    mmd_sigma="auto",          # float, or "auto": median heuristic on task-0 expert outputs, then frozen
+    mmd_estimator="v",         # "v" = paper (all pairs incl. diagonal); "u" = unbiased
+    ssi_max_hist_tasks=3,      # L
     min_cell_size=2,
-    ssi_max_cell_samples=256,     # cap per cell for support estimation; -1 = use every record
+    ssi_max_cell_samples=-1,   # cap per cell for support estimation; -1 = every record (paper)
     ssi_triples_per_step=4,
     ssi_samples_per_cell=32,
     # retention and checkpoints (Sec. 3.4)
     eps_f=0.1,
     # expansion (Sec. 3.4)
-    p_max=None,                   # absolute P_max; if None, p_max_factor * P_E(initial bank)
+    p_max=None,                # absolute P_max; if None, p_max_factor * P_E(initial bank)
     p_max_factor=4.0,
     lambda_grow=0.5,
-    max_expansion_trials=2,       # G
+    max_expansion_trials=2,    # G
     warmup_steps=50,
     probe_size=2048,
     # experiment tracking (only used when the config sets "wandb": true)
-    wandb_log_interval=50,        # log training losses every N optimizer steps; 0 = off
+    wandb_log_interval=50,     # log training losses every N optimizer steps; 0 = off
 )
+
+
+def select_control_triples(mode, subset_triples, candidates, match_J, rng):
+    """Triples, weights and J_t for an alignment mode (Sec. 3.3 / evaluation controls).
+
+    subset_triples: [(m, s, c, a, d)] retained by the subset rule (Eq. 13-14).
+    candidates:     [(m, s, c)] every eligible triple.
+    match_J:        True -> "global"/"random" adapt the subset rule's J_t and draw only triples of
+                    those experts; False -> the earlier behaviour (global: J = all experts of the
+                    candidates, random: J = experts of the drawn triples).
+    Returns (triples, w, J) with w summing to 1 (or empty).
+    """
+    sub = [(m, s, c) for m, s, c, _, _ in subset_triples]
+    J_subset = sorted({m for m, _, _ in sub})
+    if mode in ("subset", "none"):
+        a = np.array([z[3] for z in subset_triples], dtype=np.float64)
+        w = a / a.sum() if len(a) else a
+        return sub, w, J_subset
+    pool = [z for z in candidates if z[0] in set(J_subset)] if match_J else list(candidates)
+    if mode == "global":
+        triples = list(pool)
+    elif mode == "random":
+        k = min(len(sub), len(pool))
+        pick = rng.choice(len(pool), size=k, replace=False) if k > 0 else []
+        triples = [pool[i] for i in pick]
+    else:
+        raise ValueError(f"Unknown ssi_mode {mode}")
+    w = np.full(len(triples), 1.0 / max(1, len(triples)))
+    if match_J:
+        J = J_subset
+    elif mode == "global":
+        J = None  # all old experts; resolved by the caller
+    else:
+        J = sorted({m for m, _, _ in triples})
+    return triples, w, J
 
 
 class Learner(BaseLearner):
@@ -100,6 +155,7 @@ class Learner(BaseLearner):
         self.scenario = str(self.hp["scenario"]).lower()
         assert self.scenario in ("dil", "cil"), f"Unknown scenario {self.scenario}"
         assert self.hp["ssi_mode"] in ("subset", "none", "global", "random")
+        assert self.hp["ssi_control_J"] in ("matched", "own")
         seed = args["seed"] if isinstance(args["seed"], int) else int(args["seed"][0])
 
         self._network = MoSSNet(args).to(self._device)
@@ -110,8 +166,8 @@ class Learner(BaseLearner):
         if self.p_max < p_init:
             raise ValueError(f"P_max={self.p_max} must accommodate the initial bank ({p_init}).")
         self.sigma = None if self.hp["mmd_sigma"] == "auto" else float(self.hp["mmd_sigma"])
-
         self.np_rng = np.random.default_rng(seed + 17)
+
         self._test_cache = OrderedDict()
         self._teacher = None
         self._supports = None
@@ -120,8 +176,9 @@ class Learner(BaseLearner):
         self._cil_warned = False
         self._train_step = 0
         self._experts_added = 0
-
+        self._pretask_chain = False
         logging.info(f"[MoSS] scenario={self.scenario}, ssi_mode={self.hp['ssi_mode']}, "
+                     f"ssi_control_J={self.hp['ssi_control_J']}, "
                      f"feature_dim={self._network.feature_dim}, M0={moe.num_experts}, k={moe.topk}, "
                      f"P_E(initial)={p_init:,}, P_max={self.p_max:,}")
 
@@ -134,7 +191,6 @@ class Learner(BaseLearner):
         self._cur_task += 1
         t = self._cur_task
         self.data_manager = data_manager
-
         if self.scenario == "dil":
             self._total_classes = data_manager.nb_classes
             train_ds = data_manager.get_task_dataset(t, source="train", mode="test")
@@ -156,7 +212,6 @@ class Learner(BaseLearner):
                      f"{len(self.memory.fit)}/{len(self.memory.val)}")
 
         self._learn_task(t)
-
         self.memory.update(self.cur["u_fit"], self.cur["y_fit"], self.cur["u_val"], self.cur["y_val"], t)
 
     # ---------------------------------------------------------------------------- data helpers
@@ -191,6 +246,10 @@ class Learner(BaseLearner):
         # The pre-task model's class space: all classes in DIL, previously seen classes in CIL.
         return self._total_classes if self.scenario == "dil" else self._known_classes
 
+    def _predict(self, moe, u):
+        """Prediction forward: routing-based dispatch unless sparse_dispatch is off."""
+        return moe(u, expert_out=not bool(self.hp["sparse_dispatch"]))
+
     # ============================================================================ one task
     def _learn_task(self, t):
         hp = self.hp
@@ -200,6 +259,7 @@ class Learner(BaseLearner):
 
         # theta^- : frozen pre-task model; the retention reference for every phase and trial.
         self._teacher, self._ref_hist_risk, self._supports = None, {}, None
+        self._pretask_chain = False
         if t > 0:
             self._teacher = copy.deepcopy(moe).eval()
             for p in self._teacher.parameters():
@@ -212,8 +272,16 @@ class Learner(BaseLearner):
                                             epochs=hp["first_task_epochs"], use_div=True)
         else:
             # (1) Reuse: experts frozen; router + head with L_sup + lambda_pred L_pred.
-            diag["reuse"] = self._run_phase(moe, "reuse", [], epochs=hp["reuse_epochs"])
-            # (2) Supports from the reuse snapshot theta-bar (fitting data only).
+            #     Dense exploration updates first (every router receives gradient), then sparse
+            #     refinement; only sparse checkpoints (and the feasible input) are eligible.
+            n_explore = int(hp["reuse_explore_epochs"])
+            explore_plan = self._make_plan(n_explore) if n_explore > 0 else []
+            refine_plan = self._make_plan(hp["reuse_epochs"])
+            if explore_plan and not refine_plan:
+                logging.warning("[MoSS] reuse_epochs=0: exploration has no sparse checkpoint to select.")
+            diag["reuse"] = self._run_phase(moe, "reuse", [], plan=explore_plan + refine_plan,
+                                            dense_steps=len(explore_plan))
+            # (2) Supports from the selected sparse reuse checkpoint theta-bar (fitting data only).
             sup, sup_diag = self._estimate_supports(t)
             self._supports = sup
             diag["supports"] = sup_diag
@@ -222,9 +290,13 @@ class Learner(BaseLearner):
             diag["adapt"] = self._run_phase(moe, "adapt", sup["J"], epochs=hp["adapt_epochs"],
                                             use_div=True, use_feat=True, use_ssi=use_ssi)
             self._supports = None
+            # theta^a is still theta^- when neither reuse nor adaptation changed the model.
+            self._pretask_chain = all(diag[p]["fallback_to_input"] or diag[p]["selected_input"]
+                                      for p in ("reuse", "adapt"))
 
         # (4) Expansion trials (also on the first task).
         diag["expansion"] = self._expansion_trials(t)
+
         if self.sigma is None:
             self.sigma = self._median_sigma()
             logging.info(f"[MoSS] MMD bandwidth fixed to sigma={self.sigma:.4f} (median heuristic)")
@@ -275,10 +347,18 @@ class Learner(BaseLearner):
 
     def _run_phase(self, moe, name, trainable_experts, epochs=None, plan=None, use_div=False,
                    use_feat=False, use_ssi=False, warmup_steps=0, forced_expert=None,
-                   allow_input_fallback=True):
+                   allow_input_fallback=True, dense_steps=0):
         """Train the given parameter subset and return to the best feasible checkpoint
-        (Eq. 20: F_t <= eps_f and P_E <= P_max; lowest risk on D_t^val). If no checkpoint of the
-        phase is feasible, the phase's input checkpoint is restored (when allowed)."""
+        (Eq. 20: F_t <= eps_f and P_E <= P_max; lowest risk on D_t^val).
+
+        When allow_input_fallback is set, the phase's input checkpoint is evaluated too: with
+        select_include_input it competes with the post-update checkpoints if it is feasible, and
+        it is restored if no checkpoint at all is feasible. The expansion candidate passes
+        allow_input_fallback=False, so it can only select a trained (post-warm-up) checkpoint.
+
+        warmup_steps / forced_expert: candidate warm-up routing (Eq. 22).
+        dense_steps: leading steps with dense routing (reuse exploration).
+        Checkpoints are only evaluated after both warm-up and dense steps, with ordinary routing."""
         hp = self.hp
         self._set_trainable(moe, trainable_experts)
         opt = self._make_optimizer([p for p in moe.parameters() if p.requires_grad])
@@ -289,13 +369,22 @@ class Learner(BaseLearner):
         steps_per_epoch = max(1, math.ceil(len(self.cur["y_fit"]) / hp["batch_size"]))
         interval = int(hp["eval_interval"]) or steps_per_epoch
         eval_points = {i for i in range(len(plan)) if (i + 1) % interval == 0} | {len(plan) - 1}
-
+        first_eval = max(int(warmup_steps), int(dense_steps))
         best_risk, best_state, best_f, n_eval, n_feasible = math.inf, None, None, 0, 0
+        selected_input, input_feasible, input_risk = False, None, None
+        if allow_input_fallback and hp["select_include_input"]:
+            moe.forced_expert, moe.dense_routing = None, False
+            input_risk, input_f, input_pe = self._checkpoint_stats(moe)
+            input_feasible = bool(input_f <= hp["eps_f"] and input_pe <= self.p_max)
+            if input_feasible:
+                best_risk, best_state, best_f, selected_input = input_risk, input_state, input_f, True
         sums = {}
+
         prog = tqdm(range(len(plan)), desc=f"[MoSS] {name}", leave=False)
         for step in prog:
             moe.train()
             moe.forced_expert = forced_expert if (forced_expert is not None and step < warmup_steps) else None
+            moe.dense_routing = step < dense_steps
             ci, ri = plan[step]
             loss, parts = self._loss(moe, ci, ri, trainable_experts, V, use_div, use_feat, use_ssi)
             opt.zero_grad(set_to_none=True)
@@ -310,16 +399,17 @@ class Learner(BaseLearner):
                 wandb_logger.log({"train_step": self._train_step, "train/task": self._cur_task,
                                   **{f"train/{kind}/{k}": v for k, v in parts.items()},
                                   f"train/{kind}/total": loss.item()})
-            if step in eval_points and step >= warmup_steps:
-                moe.forced_expert = None
+            if step in eval_points and step >= first_eval:
+                moe.forced_expert, moe.dense_routing = None, False
                 risk, f_t, p_e = self._checkpoint_stats(moe)
                 n_eval += 1
                 feasible = (f_t <= hp["eps_f"]) and (p_e <= self.p_max)
                 n_feasible += int(feasible)
                 if feasible and risk < best_risk:
                     best_risk, best_state, best_f = risk, copy.deepcopy(moe.state_dict()), f_t
+                    selected_input = False
                 prog.set_description(f"[MoSS] {name} val={risk:.3f} F={f_t:.3f}")
-        moe.forced_expert = None
+        moe.forced_expert, moe.dense_routing = None, False
 
         fallback = best_state is None
         if not fallback:
@@ -329,12 +419,15 @@ class Learner(BaseLearner):
         for p in moe.parameters():
             p.requires_grad = False
         moe.eval()
-
         info = {
             "steps": len(plan),
+            "dense_steps": int(dense_steps),
             "trainable_experts": list(map(int, trainable_experts)),
             "checkpoints": n_eval,
             "feasible_checkpoints": n_feasible,
+            "input_feasible": input_feasible,
+            "input_val_risk": None if input_risk is None else float(input_risk),
+            "selected_input": bool(selected_input),
             "fallback_to_input": bool(fallback),
             "val_risk": None if fallback else float(best_risk),
             "F_t": None if fallback else float(best_f),
@@ -349,10 +442,13 @@ class Learner(BaseLearner):
         hp, dev = self.hp, self._device
         n_out = self._total_classes
         parts = {}
+        sparse = bool(hp["sparse_dispatch"])
+        need_div = use_div and hp["lambda_div"] > 0 and len(trainable) > 0
+        need_feat = use_feat and len(V) > 0 and hp["lambda_feat"] > 0
 
         u_c = self.cur["u_fit"][ci].to(dev)
         y_c = self.cur["y_fit"][ci].to(dev)
-        out_c = moe(u_c)
+        out_c = moe(u_c, expert_out=need_div or not sparse)
         loss = F.cross_entropy(out_c["logits"][:, :n_out], y_c)
         parts["cur"] = loss.item()
         outs = [out_c]
@@ -360,20 +456,20 @@ class Learner(BaseLearner):
         if ri is not None:
             mu, my, _ = self.memory.fit.data()
             u_r, y_r = mu[ri].to(dev), my[ri].to(dev)
-            out_r = moe(u_r)
+            out_r = moe(u_r, expert_out=need_div or need_feat or not sparse)
             outs.append(out_r)
             l_rep = F.cross_entropy(out_r["logits"][:, :n_out], y_r)
             loss = loss + hp["lambda_rep"] * l_rep
             parts["rep"] = l_rep.item()
             if self._teacher is not None:
                 with torch.no_grad():
-                    t_out = self._teacher(u_r)
+                    t_out = self._teacher(u_r, expert_out=need_feat or not sparse)
                 nt = self._n_teacher_classes
                 if hp["lambda_pred"] > 0 and nt > 0:
                     l_pred = kd_kl(out_r["logits"][:, :nt], t_out["logits"][:, :nt])
                     loss = loss + hp["lambda_pred"] * l_pred
                     parts["pred"] = l_pred.item()
-                if use_feat and len(V) > 0 and hp["lambda_feat"] > 0:
+                if need_feat:
                     cur_h = out_r["expert_out"][:, V, :]
                     ref_h = t_out["expert_out"][:, V, :]
                     r = cur_h.shape[-1]
@@ -381,7 +477,7 @@ class Learner(BaseLearner):
                     loss = loss + hp["lambda_feat"] * l_feat
                     parts["feat"] = l_feat.item()
 
-        if use_div and hp["lambda_div"] > 0 and len(trainable) > 0:
+        if need_div:
             zs = torch.cat([o["expert_out"] for o in outs], dim=0)
             act = torch.cat([o["active"] for o in outs], dim=0).float()
             co = (act.t() @ act) > 0
@@ -398,7 +494,6 @@ class Learner(BaseLearner):
             l_ssi = self._ssi_loss(moe)
             loss = loss + hp["lambda_ssi"] * l_ssi
             parts["ssi"] = l_ssi.item()
-
         return loss, parts
 
     def _ssi_loss(self, moe):
@@ -432,9 +527,9 @@ class Learner(BaseLearner):
         n_out = self._total_classes
         rho, util, feats = 0.0, 0.0, []
         for i in range(0, len(u), 1024):
-            out = moe(u[i:i + 1024].to(self._device))
+            out = moe(u[i:i + 1024].to(self._device))  # dense: reference laws need every expert
             logp = F.log_softmax(out["logits"][:, :n_out], dim=-1)[:, c]
-            loo = moe.leave_one_out_logits(out["z"], out["weights"], out["expert_out"])[:, :, :n_out]
+            loo = moe.leave_one_out_logits(out["scores"], out["active"], out["expert_out"])[:, :, :n_out]
             logp_minus = F.log_softmax(loo, dim=-1)[:, :, c]
             rho = rho + out["weights"].sum(0)
             util = util + (logp.unsqueeze(1) - logp_minus).sum(0)
@@ -452,7 +547,6 @@ class Learner(BaseLearner):
         M = moe.num_experts
         min_n = int(hp["min_cell_size"])
         y_fit = self.cur["y_fit"]
-
         cur_cells = {}
         for c in torch.unique(y_fit).tolist():
             idx = torch.nonzero(y_fit == c, as_tuple=True)[0]
@@ -460,8 +554,8 @@ class Learner(BaseLearner):
                 cur_cells[int(c)] = idx
         all_hist = self.memory.fit.indices_by_cell()
         hist_cells = {k: v for k, v in all_hist.items() if len(v) >= min_n and k[0] < t}
-
         mu, _, _ = self.memory.fit.data()
+
         st_cur = {c: self._cell_stats(moe, self.cur["u_fit"][idx], c) for c, idx in cur_cells.items()}
         st_hist = {k: self._cell_stats(moe, mu[idx], k[1]) for k, idx in hist_cells.items()}
 
@@ -488,23 +582,10 @@ class Learner(BaseLearner):
                 subset += [(m, s, c, a, d) for a, s, d in cands[: int(hp["ssi_max_hist_tasks"])]]
 
         mode = hp["ssi_mode"]
-        if mode in ("subset", "none"):
-            triples = [(m, s, c) for m, s, c, _, _ in subset]
-            a = np.array([z[3] for z in subset], dtype=np.float64)
-            w = a / a.sum() if len(a) else a
-        elif mode == "global":
-            triples = list(candidates)
-            w = np.full(len(triples), 1.0 / max(1, len(triples)))
-        else:  # random, matched to the size of the subset rule
-            k = min(len(subset), len(candidates))
-            pick = self.np_rng.choice(len(candidates), size=k, replace=False) if k > 0 else []
-            triples = [candidates[i] for i in pick]
-            w = np.full(len(triples), 1.0 / max(1, len(triples)))
-
-        if mode == "global":
+        triples, w, J = select_control_triples(mode, subset, candidates,
+                                               hp["ssi_control_J"] == "matched", self.np_rng)
+        if J is None:  # "global" with ssi_control_J="own": every old expert
             J = list(range(M))
-        else:
-            J = sorted({m for m, _, _ in triples})
 
         if self.scenario == "cil" and not self._cil_warned and not candidates:
             logging.warning("[MoSS] Class-incremental split: no class occurs in two tasks, so no "
@@ -516,6 +597,7 @@ class Learner(BaseLearner):
         n_hist_tasks = len({s for (s, _) in all_hist})
         diag = {
             "mode": mode,
+            "control_J": hp["ssi_control_J"],
             "current_cells_eligible": len(cur_cells),
             "hist_cells_stored": len(all_hist),
             "hist_cells_eligible": len(hist_cells),
@@ -559,8 +641,7 @@ class Learner(BaseLearner):
             if hp["warmup_steps"] >= len(plan):
                 logging.warning(f"[MoSS] warmup_steps={hp['warmup_steps']} >= trial length {len(plan)}: "
                                 "no post-warm-up candidate checkpoint can exist.")
-
-            # Control branch: existing bank (all experts frozen), router + head; fallback = theta^cur.
+            # Control branch: existing bank (all experts frozen), router + head; input = theta^cur.
             ctrl = copy.deepcopy(cur)
             ctrl_info = self._run_phase(ctrl, f"expand{g}-control", [], plan=plan)
             # Candidate branch: one new expert + router score; previously accepted experts frozen.
@@ -569,7 +650,13 @@ class Learner(BaseLearner):
             cand_info = self._run_phase(cand, f"expand{g}-candidate", [m_new], plan=plan, use_div=True,
                                         warmup_steps=int(hp["warmup_steps"]), forced_expert=m_new,
                                         allow_input_fallback=False)
-            rec = {"trial": g, "control": ctrl_info, "candidate": cand_info}
+            control_kept_input = bool(ctrl_info["fallback_to_input"] or ctrl_info["selected_input"])
+            # Diagnostic: the control is still the pre-task model theta^- (no update survived
+            # reuse, adaptation or the control branch), so Delta compares against a model that
+            # never fitted the current task.
+            control_is_pretask = bool(t > 0 and g == 0 and self._pretask_chain and control_kept_input)
+            rec = {"trial": g, "control": ctrl_info, "candidate": cand_info,
+                   "control_kept_input": control_kept_input, "control_is_pretask": control_is_pretask}
             if cand_info["fallback_to_input"]:
                 rec.update(accepted=False, reason="no feasible candidate checkpoint")
                 self._network.moe = ctrl
@@ -583,7 +670,8 @@ class Learner(BaseLearner):
             accepted = delta > thr
             rec.update(accepted=bool(accepted), delta=float(delta), threshold=float(thr), delta_P=int(dP))
             logging.info(f"[MoSS] expansion trial {g}: delta={delta:.4f} vs threshold={thr:.4f} -> "
-                         f"{'ACCEPT' if accepted else 'reject'}")
+                         f"{'ACCEPT' if accepted else 'reject'}"
+                         + (" (control is the pre-task model)" if control_is_pretask else ""))
             trials.append(rec)
             if accepted:
                 self._network.moe = cand
@@ -598,7 +686,7 @@ class Learner(BaseLearner):
         moe.eval()
         tot, n = 0.0, 0
         for i in range(0, len(y), 2048):
-            logits = moe(u[i:i + 2048].to(self._device))["logits"][:, :n_cls]
+            logits = self._predict(moe, u[i:i + 2048].to(self._device))["logits"][:, :n_cls]
             tot += F.cross_entropy(logits, y[i:i + 2048].to(self._device), reduction="sum").item()
             n += len(y[i:i + 2048])
         return tot / max(1, n)
@@ -641,7 +729,7 @@ class Learner(BaseLearner):
         for t, (u, y) in self._test_cache.items():
             correct, hits = 0, 0
             for i in range(0, len(y), 2048):
-                logits = moe(u[i:i + 2048].to(self._device))["logits"][:, :n_out]
+                logits = self._predict(moe, u[i:i + 2048].to(self._device))["logits"][:, :n_out]
                 yy = y[i:i + 2048].to(self._device)
                 k = min(self.topk, n_out)
                 top = logits.topk(k, dim=-1).indices
@@ -687,6 +775,7 @@ class Learner(BaseLearner):
         if trials:
             data["moss/expansion/first_delta"] = trials[0].get("delta")
             data["moss/expansion/threshold"] = trials[0].get("threshold")
+            data["moss/expansion/control_is_pretask"] = int(trials[0].get("control_is_pretask", False))
         sup = diag.get("supports")
         if sup:
             data["moss/supports/I_t"] = sup["I_t"]
@@ -702,6 +791,7 @@ class Learner(BaseLearner):
             if not info:
                 continue
             data[f"moss/{phase}/fallback_to_input"] = int(info["fallback_to_input"])
+            data[f"moss/{phase}/selected_input"] = int(info.get("selected_input", False))
             data[f"moss/{phase}/feasible_frac"] = info["feasible_checkpoints"] / max(1, info["checkpoints"])
             if info["val_risk"] is not None:
                 data[f"moss/{phase}/val_risk"] = info["val_risk"]
